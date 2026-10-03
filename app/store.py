@@ -85,6 +85,52 @@ def write_transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextlib.contextmanager
+def read_transaction() -> Iterator[sqlite3.Connection]:
+    """Read-only deferred transaction spanning several SELECTs.
+
+    All reads inside share one snapshot (and, with the journal in WAL mode,
+    never block on -- or block -- a writer), so e.g. a history and one of its
+    import sessions are always observed from the same committed state.  A
+    read-only transaction takes no locks and is simply dropped on close.
+    Before any writer has created the schema (or when the database file does
+    not exist at all) it yields ``None``: nothing can be stored in a
+    non-existent schema.
+    """
+
+    try:
+        conn = _connect(for_write=False)
+    except sqlite3.OperationalError:
+        yield None
+        return
+
+    ready = False
+    try:
+        try:
+            conn.execute("BEGIN")
+            # A deferred BEGIN succeeds even before any writer has created the
+            # schema; probe for it so missing-table reads report "no row"
+            # instead of raising on their first SELECT.
+            tables = conn.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('histories', "
+                "'import_sessions')"
+            ).fetchone()[0]
+            ready = tables == 2
+        except sqlite3.OperationalError:
+            ready = False
+        if not ready:
+            conn.close()
+            yield None
+            return
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
 def get_history(history_id: str) -> sqlite3.Row | None:
     """Committed snapshot of one history, or None when it does not exist.
 

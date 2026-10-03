@@ -63,6 +63,19 @@ staged events untouched for a retry, and a closed session rejects further
 appends and commits with 409.  Staging never affects the history reads or
 verdicts, and sessions persist in the same SQLite database, so they survive
 restarts.
+
+A read-only missing-ranges endpoint
+(/api/histories/{id}/import-sessions/{sid}/missing-ranges) reports, from one
+committed snapshot of the history and one session (open or closed), which
+per-replica seq ranges still have to be fetched from the source: a staged
+event whose full content differs from the committed event under the same
+identity is a 409 listing every conflicting replica_id/seq; otherwise each
+replica's required upper bound is the max of its own highest merged seq and
+the highest clock component any merged event carries for it, and the missing
+seqs from 1 to that bound come back as maximal contiguous closed ranges
+(never enumerated one by one, so a 10**12 bound is still one range).  It
+commits nothing and never changes the history, the staged events or the
+session state.
 """
 
 from __future__ import annotations
@@ -854,6 +867,113 @@ def _load_session_row(
 ) -> tuple[str, str, list[Event]]:
     events = [_wire_model(raw, replica_ids) for raw in json.loads(row["events"])]
     return row["id"], row["status"], events
+
+
+def _session_missing_ranges(
+    replica_ids: list[str],
+    committed: list[Event],
+    staged: list[Event],
+) -> list[dict]:
+    """Seqs an import session must still fetch before it *could* be complete.
+
+    The committed history and the staged events are read as one merged set of
+    ``(replica_id, seq)`` identities.  First the two sources are checked
+    against each other on the same identity: a staged event whose full content
+    differs from the committed event under the same ``(replica_id, seq)`` is
+    a 409 (and every such identity is reported together, sorted by
+    replica_id then seq).  Identical content is the same event and counts once.
+
+    For each replica the required upper bound is
+
+        max(its own highest event seq,
+            max clock component any merged event carries for it),
+
+    i.e. everything the merged events causally claim to know must be present.
+    Missing identities are the numbers in the closed span ``1..bound`` minus
+    the identities already present; they are coalesced into the largest
+    possible contiguous closed ranges.  The bound of a replica no event
+    references and that has no events itself is 0, which yields no range.  The
+    algorithm works from the present identities alone -- it never enumerates
+    the individual missing numbers, so a bound of ``10**12`` still costs one
+    range.
+
+    An empty result only means every referenced identity is available; it
+    says nothing about whether a commit would pass (causal order, caps).
+    """
+
+    committed_by_id = {(ev.replica_id, ev.seq): ev for ev in committed}
+
+    # Same identity in both the committed history and the staging area must
+    # carry identical *full* content; collect every mismatch before failing.
+    conflicts: list[tuple[str, int]] = []
+    for ev in staged:
+        prior = committed_by_id.get((ev.replica_id, ev.seq))
+        if prior is not None and not _same_event_content(prior, ev):
+            conflicts.append((ev.replica_id, ev.seq))
+    if conflicts:
+        conflicts.sort()
+        raise ConflictStateError(
+            [
+                {
+                    "code": "event_content_mismatch",
+                    "message": (
+                        f"staged event with replica_id {rid!r}, seq {seq} "
+                        "differs in content from the event with the same "
+                        "identity already committed in this history; resolve "
+                        "the conflicting retransmission before the session can "
+                        "be completed"
+                    ),
+                    "replica_id": rid,
+                    "seq": seq,
+                }
+                for rid, seq in conflicts
+            ]
+        )
+
+    # Present identities per replica and the per-replica required upper bound.
+    present: dict[str, set[int]] = {rid: set() for rid in replica_ids}
+    bound: dict[str, int] = {rid: 0 for rid in replica_ids}
+
+    def account(ev: Event) -> None:
+        seqs = present.setdefault(ev.replica_id, set())
+        seqs.add(ev.seq)
+        if ev.seq > bound.get(ev.replica_id, 0):
+            bound[ev.replica_id] = ev.seq
+        # The clock covers exactly the history's replica_ids for committed
+        # events and for genuinely new staged identities; use get so a
+        # retransmission-shaped clock never raises a KeyError here.
+        for rid in replica_ids:
+            n = ev.clock.get(rid, 0)
+            if n > bound.get(rid, 0):
+                bound[rid] = n
+
+    for ev in committed:
+        account(ev)
+    for ev in staged:
+        account(ev)
+
+    ranges: list[dict] = []
+    for rid in replica_ids:
+        upper = bound.get(rid, 0)
+        if upper <= 0:
+            continue
+        # Coalesce the gaps inside 1..upper from the present identities only;
+        # iteration is bounded by present identities, never by the (possibly
+        # 10**12-large) span itself.
+        cursor = 1
+        for n in sorted(present.get(rid, ())):
+            if n > cursor:
+                ranges.append(
+                    {"replica_id": rid, "start_seq": cursor, "end_seq": n - 1}
+                )
+            cursor = n + 1
+        if cursor <= upper:
+            ranges.append(
+                {"replica_id": rid, "start_seq": cursor, "end_seq": upper}
+            )
+
+    ranges.sort(key=lambda r: (r["replica_id"], r["start_seq"]))
+    return ranges
 
 
 def _session_state(
@@ -1805,3 +1925,44 @@ def commit_import_session(history_id: str, session_id: str) -> dict:
         )
         store.close_session(conn, session_id)
         return _history_state(hid, replica_ids, merged)
+
+
+@app.get(
+    "/api/histories/{history_id}/import-sessions/{session_id}/missing-ranges",
+    tags=["import-sessions"],
+    response_model=None,
+)
+def read_import_session_missing_ranges(
+    history_id: str, session_id: str
+) -> dict:
+    """List the seq ranges still missing from the source for this session.
+
+    The history's committed events and the session's staged events are read
+    from one committed snapshot (the session may be open *or* closed) and
+    merged by identity.  An identity present in both with different full
+    content is a 409 listing every conflicting replica_id/seq (sorted), with
+    no range list.  Otherwise, for each replica the required upper bound is
+    the maximum of that replica's own highest merged seq and the highest
+    clock component any merged event carries for it; the missing numbers in
+    ``1..bound`` are returned as the largest possible contiguous *closed*
+    ranges, sorted by replica_id then start_seq -- individual missing seqs
+    are never expanded (a ``10**12`` bound stays one range).  A bound of 0
+    yields nothing, and an empty list means identities are complete, not
+    that a commit would succeed.  Purely read-only: history, staging area
+    and session status are never modified.  Unknown history or session ->
+    404.
+    """
+
+    with store.read_transaction() as conn:
+        if conn is None:
+            raise HistoryNotFound(history_id)
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        _, replica_ids, committed = _load_row(row)
+        srow = store.select_session_for_update(conn, history_id, session_id)
+        if srow is None:
+            raise SessionNotFound(session_id)
+        _, _, staged = _load_session_row(srow, replica_ids)
+        ranges = _session_missing_ranges(replica_ids, committed, staged)
+    return {"missing_ranges": ranges}

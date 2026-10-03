@@ -2784,3 +2784,355 @@ print('ok')
     )
     assert resume.returncode == 0, resume.stderr
     assert resume.stdout.strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Import session missing-ranges: what still has to come from the source
+# ---------------------------------------------------------------------------
+
+
+def session_missing(hid, sid):
+    return client.get(
+        f"/api/histories/{hid}/import-sessions/{sid}/missing-ranges"
+    )
+
+
+def test_missing_ranges_empty_session_over_contiguous_history_is_empty():
+    # No staged events at all: the bounds come solely from the committed
+    # history, which (having passed validation) references only events it
+    # contains, so every range is empty.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r2", 1, "k", put="b", clock={"r1": 0, "r2": 1}),
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 1}),
+        ],
+    ).json()["id"]
+    sid = create_session(hid)
+
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"missing_ranges": []}
+
+    # The clock-component bound is exercised by staged events below.
+
+
+def test_missing_ranges_gaps_and_ranges_sorted_within_and_across_replicas():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+
+    # r1: has 1 (committed) and 3 (staged); staged r2/1 knows r1 up to 4.
+    # Required bounds: r1 -> 4 (clock component), r2 -> 1 (own seq).
+    # Missing r1 seqs: 2, 4 -> ranges [2,2] and [4,4]; r2: none.
+    assert (
+        session_append(
+            hid,
+            sid,
+            [
+                ev("r1", 3, "k", put="c", clock={"r1": 3, "r2": 0}),
+                ev("r2", 1, "k", put="b", clock={"r1": 4, "r2": 1}),
+            ],
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": 2},
+            {"replica_id": "r1", "start_seq": 4, "end_seq": 4},
+        ]
+    }
+
+    # Coalescing: fill r1/2; the prefix up to the bound now lacks 4 only, and
+    # staging r1/4 coalesces nothing further.  Stage r1/2 first.
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 2, "k", put="b2", clock={"r1": 2, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 4, "end_seq": 4}
+        ]
+    }
+
+    # A long contiguous hole is one closed range, not an enumeration.
+    sid2 = create_session(hid)
+    assert (
+        session_append(
+            hid,
+            sid2,
+            [ev("r2", 1, "k", put="b", clock={"r1": 10, "r2": 1})],
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid2)
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": 10}
+        ]
+    }
+
+
+def test_missing_ranges_own_tail_sets_bound_beyond_clock_components():
+    # r1/3 staged with clocks only at r1=3,r2=0; nothing references higher
+    # seqs.  Its own seq still requires r1/1..3, and r1/1 is committed, so
+    # the missing range is [2,3].
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 3, "k", put="c", clock={"r1": 3, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": 2}
+        ]
+    }
+
+
+def test_missing_ranges_bound_zero_replica_yields_nothing():
+    hid = hist_create(
+        ["r1", "r2", "r3"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0, "r3": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    # Nothing references r2 or r3: their bound is 0 and they get no range,
+    # even though they have zero events.
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"missing_ranges": []}
+
+
+def test_missing_ranges_huge_seq_is_one_range_and_one_identity():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    huge = 10**12
+    # A single staged event on r2 claims to know r1 up to 10^12.
+    assert (
+        session_append(
+            hid,
+            sid,
+            [ev("r2", 1, "k", put="b", clock={"r1": huge, "r2": 1})],
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": huge}
+        ]
+    }
+    # The missing seqs are never enumerated: exactly one range.
+    assert len(data["missing_ranges"]) == 1
+
+
+def test_missing_ranges_identical_committed_and_staged_content_is_complete():
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    # Re-stage both committed events verbatim: identities merge, no gaps.
+    assert session_append(hid, sid, two_branch_conflict()).status_code == 200
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"missing_ranges": []}
+
+
+def test_missing_ranges_full_identities_do_not_guarantee_commit():
+    # Empty ranges mean identities are complete -- not that the clocks are
+    # causally consistent.  Here every seq 1..3 on r1 and 1..2 on r2 is
+    # present, but the predecessor r1/2 (clock {r1:2,r2:1}) is not <=
+    # r1/3's clock {r1:3,r2:0}: the gap query returns 200 + [], the later
+    # commit returns 422.
+    hid = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r2", 1, "k", put="b", clock={"r1": 0, "r2": 1}),
+            ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 1}),
+        ],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid,
+            sid,
+            [
+                ev("r1", 2, "k", put="c", clock={"r1": 2, "r2": 1}),
+                ev("r2", 2, "k", put="d", clock={"r1": 1, "r2": 2}),
+                ev("r1", 3, "k", put="e", clock={"r1": 3, "r2": 0}),
+            ],
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"missing_ranges": []}
+
+    r = session_commit(hid, sid)
+    assert r.status_code == 422, r.text
+    # Query and failed commit leave everything in place.
+    assert session_get(hid, sid).json()["status"] == "open"
+    assert len(hist_get(hid).json()["events"]) == 2
+
+
+def test_missing_ranges_staged_vs_committed_different_content_is_409():
+    hid = create_conflict_history()
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid,
+            sid,
+            [
+                # Same identity as committed r1/1, different value.
+                ev("r1", 1, "name", put="different", clock={"r1": 1, "r2": 0}),
+                # Plus a genuinely new event; it must not silence the 409.
+                ev("r1", 2, "x", put="y", clock={"r1": 2, "r2": 1}),
+            ],
+        ).status_code
+        == 200
+    )
+    before_hist = hist_get(hid).json()
+    before_session = session_get(hid, sid).json()
+
+    r = session_missing(hid, sid)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    # No range list is returned on conflict.
+    assert "missing_ranges" not in body
+    (err,) = body["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["replica_id"] == "r1"
+    assert err["seq"] == 1
+
+    # Read-only: history and staging area unchanged.
+    assert hist_get(hid).json() == before_hist
+    assert session_get(hid, sid).json() == before_session
+
+
+def test_missing_ranges_all_conflicts_listed_and_sorted_by_replica_then_seq():
+    # Committed r1/1, r1/2, r2/1; stage mismatching copies of r1/2 and r2/1
+    # and r1/1 (arrival order deliberately unsorted).
+    seed = [
+        ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0}),
+        ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1}),
+        ev("r1", 2, "k", put="c", clock={"r1": 2, "r2": 1}),
+    ]
+    hid = hist_create(["r1", "r2"], seed).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid,
+            sid,
+            [
+                ev("r1", 2, "k", put="c-X", clock={"r1": 2, "r2": 1}),
+                ev("r2", 1, "k", put="b-X", clock={"r1": 1, "r2": 1}),
+                ev("r1", 1, "k", put="a-X", clock={"r1": 1, "r2": 0}),
+            ],
+        ).status_code
+        == 200
+    )
+    r = session_missing(hid, sid)
+    assert r.status_code == 409, r.text
+    conflicts = [
+        (e["replica_id"], e["seq"]) for e in r.json()["detail"]
+    ]
+    assert conflicts == [("r1", 1), ("r1", 2), ("r2", 1)]
+    assert all(e["code"] == "event_content_mismatch" for e in r.json()["detail"])
+
+
+def test_missing_ranges_closed_session_is_still_queryable():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 3, "k", put="c", clock={"r1": 3, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    # Gaps visible while open: r1/2 missing.
+    r = session_missing(hid, sid)
+    assert r.json() == {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": 2}
+        ]
+    }
+    # Commit fails (gap) -> session stays open.  Fill it and commit to close.
+    assert (
+        session_append(
+            hid, sid, [ev("r1", 2, "k", put="b", clock={"r1": 2, "r2": 0})]
+        ).status_code
+        == 200
+    )
+    assert session_commit(hid, sid).status_code == 200
+    assert session_get(hid, sid).json()["status"] == "closed"
+
+    # The closed session is still queryable; its staged identities are now
+    # all committed, so the ranges are empty.
+    r = session_missing(hid, sid)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"missing_ranges": []}
+
+
+def test_missing_ranges_unknown_history_or_session_is_404():
+    missing_hid = "0" * 32
+    r = session_missing(missing_hid, "1" * 32)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+    hid = create_conflict_history()
+    r = session_missing(hid, "1" * 32)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "session_not_found"
+
+    # A session id of another history reads as missing.
+    other_hid = create_conflict_history()
+    sid = create_session(other_hid)
+    r = session_missing(hid, sid)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "session_not_found"
+
+
+def test_missing_ranges_is_read_only_under_repeated_queries():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid, sid, [ev("r2", 1, "k", put="b", clock={"r1": 5, "r2": 1})]
+        ).status_code
+        == 200
+    )
+    expected = {
+        "missing_ranges": [
+            {"replica_id": "r1", "start_seq": 2, "end_seq": 5}
+        ]
+    }
+    for _ in range(3):
+        assert session_missing(hid, sid).json() == expected
+    # Nothing moved into the history, the session stayed open and staged.
+    assert len(hist_get(hid).json()["events"]) == 1
+    assert session_get(hid, sid).json()["status"] == "open"
+    assert len(session_get(hid, sid).json()["events"]) == 1
+
