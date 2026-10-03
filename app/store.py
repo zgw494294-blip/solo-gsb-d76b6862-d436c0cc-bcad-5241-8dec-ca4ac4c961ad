@@ -110,6 +110,50 @@ def get_history(history_id: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def get_history_with_session(
+    history_id: str, session_id: str
+) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    """One history row and one session row from the *same* committed snapshot.
+
+    Both SELECTs run inside a single deferred read transaction, so the
+    session is always evaluated against the exact committed history state a
+    concurrent writer cannot move between the two reads.  Read-only: no write
+    lock is taken, nothing is modified.  Returns ``(None, None)`` when no
+    writer has created the schema yet; a missing history yields
+    ``(None, None)`` as well, while an existing history without that session
+    yields ``(row, None)``.
+    """
+
+    try:
+        conn = _connect(for_write=False)
+    except sqlite3.OperationalError:
+        return None, None
+    try:
+        try:
+            # A deferred transaction keeps one read snapshot for both
+            # statements (each autocommit statement could otherwise observe a
+            # different state); it ends with no write when the connection
+            # closes.
+            conn.execute("BEGIN")
+            hrow = conn.execute(
+                "SELECT id, replica_ids, events FROM histories WHERE id = ?",
+                (history_id,),
+            ).fetchone()
+            srow = None
+            if hrow is not None:
+                srow = conn.execute(
+                    "SELECT id, history_id, status, events FROM import_sessions "
+                    "WHERE id = ? AND history_id = ?",
+                    (session_id, history_id),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            # No writer has created the schema yet -> nothing can exist.
+            return None, None
+        return hrow, srow
+    finally:
+        conn.close()
+
+
 def insert_history(
     conn: sqlite3.Connection,
     history_id: str,

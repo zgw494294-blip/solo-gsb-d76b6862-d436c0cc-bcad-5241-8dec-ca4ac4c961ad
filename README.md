@@ -41,6 +41,19 @@ clock**（键序无关）判等——同内容忽略，异内容 **409**，缺�
 才 **422**。提交失败（缺依赖等）时开放会话与已暂存数据原样保留，补齐后可直接
 重试。会话同样持久化在 SQLite 中，进程/容器重启后可继续暂存与提交。
 
+会话还提供一个**只读的缺口查询**接口：给定历史 ID 与会话 ID，**不提交会话**，
+返回暂存集合相对来源仍需补取的事件区间 `missing_ranges`（每项为
+`replica_id`、闭区间 `start_seq`/`end_seq`）。查询取**同一已提交状态**的历史与
+暂存事件：先对暂存中与已提交历史同标识的事件按**原完整内容**判等，任一异内容
+即返回 **409**，一次列全全部冲突的 `replica_id`、`seq`（按二者排序），不返回
+缺口清单；之后按副本计算需求上界——**本副本已提交+暂存事件的最大自身 seq** 与
+**所有事件 clock 对该副本分量**的最大值——从 1 至上界排除已有标识，把缺失序号
+合并成最大的连续区间（不逐个展开，暂存 seq 为 10^12 也只返回一个区间），按
+`replica_id`、`start_seq` 排序。上界为 0 不产生区间；无缺口返回 200 与空列表，
+空列表**只表示标识齐全，不保证提交能通过**（因果等仍在提交时校验）。封闭会话
+也可查询；历史或会话不存在返回 **404**。查询不改历史、暂存与会话状态，旧接口
+保持不变。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -72,6 +85,7 @@ docker compose down
 | 查询会话状态与暂存事件 | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}` |
 | 暂存一批事件 | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/events` |
 | 提交会话（汇入并封闭） | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/commit` |
+| 查询会话待补缺口（只读，不提交） | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}/missing-ranges` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -939,6 +953,7 @@ curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
 | `GET` | `/api/histories/{id}/import-sessions/{sid}` | 查询会话状态（`open`/`closed`）与暂存事件（原格式，按 `replica_id`、`seq` 排序） |
 | `POST` | `/api/histories/{id}/import-sessions/{sid}/events` | 暂存一批事件（请求体只有 `events`；同标识重传按完整内容判等去重，原始条数可超过 120），返回更新后的会话状态 |
 | `POST` | `/api/histories/{id}/import-sessions/{sid}/commit` | 把暂存事件一次汇入历史并封闭会话，返回与 `GET /api/histories/{id}` 相同的结构 |
+| `GET` | `/api/histories/{id}/import-sessions/{sid}/missing-ranges` | **只读**查询仍需从来源补取的事件闭区间列表（不提交会话、不改任何状态，封闭会话也可查） |
 
 暂存规则（每次追加**全部生效或全部不生效**，失败不改暂存）：
 
@@ -1259,6 +1274,139 @@ curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/
 依然返回 200；只有再出现一个**新标识**才返回 **422** `batch_full`。任一追加
 失败时，本次批次（连同其中合法的其他事件）全部不落，已暂存事件、会话状态与
 历史都保持原样。
+
+## 会话缺口查询接口 `GET /api/histories/{id}/import-sessions/{sid}/missing-ranges`
+
+在**不提交会话**的前提下，列出暂存集合相对来源仍需补取的事件。查询为**只读**：
+历史、暂存事件与会话状态都不改变；封闭会话同样可以查询。历史与会话取自**同一
+已提交快照**，因此判断始终基于一致的已提交状态。
+
+处理顺序与规则：
+
+1. 先取暂存中每个与已提交历史**同标识**（`replica_id`、`seq` 相同）的事件，按
+   **原完整内容**判等（`key`、操作、值与**完整 `clock`**，键序无关；缺分量、
+   多出零分量、任一分量不同都算异内容）。**只要存在异内容，立即返回 409**，
+   一次列全全部冲突的 `replica_id`、`seq`（按二者排序），**不返回缺口清单**，
+   错误码沿用 `event_content_mismatch`；
+2. 否则为每个副本计算需求上界，取以下两者的最大值：
+   - 合并视角（已提交事件＋暂存事件）中该副本的最大自身 `seq`；
+   - 合并视角中**所有事件 clock 对该副本分量**的最大值（暂存事件的跨副本依赖
+     可以指向尚未到达的事件，这正是要补取的缺口）；
+3. 对每个副本，从 `1` 到上界排除已存在于已提交历史**或**暂存中的标识，把剩余
+   序号合并成**最大的连续闭区间** `[start_seq, end_seq]`；绝不逐个展开缺失序号
+   （暂存 `seq` 为 `10^12` 时也只返回一个区间）；
+4. 结果按 `replica_id`、`start_seq` 排序；上界为 `0` 的副本不产生区间。
+
+返回：
+
+- **200** `{"missing_ranges": [...]}`：每项为 `replica_id`、`start_seq`、
+  `end_seq`（闭区间）。空列表只表示**标识齐全**，不保证提交通过——连续性、
+  因果（如时钟回退）、120 条上限等仍在提交时校验；
+- **409**：暂存与已提交历史存在同标识异内容（`event_content_mismatch`），
+  明细列出全部冲突的 `replica_id`、`seq`；
+- **404**：历史不存在（`history_not_found`）或会话不存在/属于其他历史
+  （`session_not_found`）。
+
+### 20. 查询缺口，补齐后再查
+
+历史中已有 `r1/1`。开一个会话，暂存一条时钟见过 `r1/4` 的 `r2/2`——它要求
+`r1` 的序号到达 4，且它自己的前序 `r2/1` 也未到达：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+SID=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 暂存 r2/2：clock 指向 r1=4（前序 r2/1 与 r1/2..4 缺失，暂存阶段都允许）
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r2", "seq": 2, "key": "other", "put": "x",
+       "clock": {"r1": 4, "r2": 2}}
+    ]
+  }' > /dev/null
+
+# 第一次查缺口：r1 的 2..4 来自 clock 分量上界，r2 的 [1,1] 来自自身连续性
+curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missing-ranges"
+```
+
+```json
+{
+  "missing_ranges": [
+    {"replica_id": "r1", "start_seq": 2, "end_seq": 4},
+    {"replica_id": "r2", "start_seq": 1, "end_seq": 1}
+  ]
+}
+```
+
+按缺口补齐 `r1/2`～`r1/4` 与 `r2/1`（同一会话、可分多批）后再次查询，列表变空；
+注意空列表只表示标识齐全，真正能否汇入仍以提交为准：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+       "clock": {"r1": 2, "r2": 0}},
+      {"replica_id": "r1", "seq": 3, "key": "name", "put": "alice3",
+       "clock": {"r1": 3, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "other", "put": "y",
+       "clock": {"r1": 1, "r2": 1}},
+      {"replica_id": "r1", "seq": 4, "key": "name", "put": "alice4",
+       "clock": {"r1": 4, "r2": 1}}
+    ]
+  }' > /dev/null
+
+# 补齐后再查：标识齐全
+curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missing-ranges"
+# {"missing_ranges":[]}
+
+# 查询从未改变任何状态；会话仍开放，确认无误后自行决定提交
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/commit"
+```
+
+这样提交也能通过（各引用时钟严格更小），响应就是历史读取结构，会话随之封闭。
+
+缺口区间总是合并到最大：例如某副本已有 `1、3、6`，而某条事件时钟把该副本上界
+推到 `8`，返回的是 `[2,2]、[4,5]、[7,8]` 三个区间而不是 5 个单点；暂存
+`seq = 10^12` 也只会得到一个 `[2, 999999999999]` 区间。
+
+### 21. 同标识异内容：409 列全冲突，不返回缺口
+
+会话的暂存事件与**已提交历史**中同 `(replica_id, seq)` 的事件内容不同（例如
+提交失败后开放会话仍保留暂存，或历史已通过旧接口前进）时，查询返回 **409**，
+明细按 `replica_id`、`seq` 列全全部冲突，且不带 `missing_ranges`：
+
+```bash
+curl -sS -i "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missing-ranges"
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "event_content_mismatch",
+      "message": "staged event with replica_id 'r1', seq 2 already exists in the committed history with different content; stored {...}, staged {...}",
+      "replica_id": "r1",
+      "seq": 2
+    }
+  ]
+}
+```
+
+历史或会话不存在返回 **404**（`history_not_found` / `session_not_found`）；封闭
+会话仍可查询，返回它（封闭时刻）已提交状态与暂存事件的缺口，通常为空列表。
 
 ## 本地开发（不使用 Docker）
 

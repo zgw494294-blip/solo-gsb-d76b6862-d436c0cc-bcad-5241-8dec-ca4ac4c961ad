@@ -63,6 +63,18 @@ staged events untouched for a retry, and a closed session rejects further
 appends and commits with 409.  Staging never affects the history reads or
 verdicts, and sessions persist in the same SQLite database, so they survive
 restarts.
+
+A read-only missing-ranges query on a session
+(/api/histories/{id}/import-sessions/{sid}/missing-ranges) reports what the
+session would still have to fetch from the source: it takes the committed
+history and the staged events from one committed snapshot, first reports
+every staged identity that the committed history holds with different full
+content as a single sorted 409, then computes, per replica, the demand upper
+bound (the replica's highest own seq among committed+staged events or any
+event clock's component for it, whichever is larger) and coalesces the
+missing seqs from 1 to that bound into maximal closed ranges.  It never
+commits the session or changes the history, staged events or any state, and
+closed sessions are queryable as well.
 """
 
 from __future__ import annotations
@@ -872,6 +884,113 @@ def _session_state(
         "status": status,
         "events": [_canonical_wire(ev, replica_ids) for ev in ordered],
     }
+
+
+def _missing_ranges(
+    replica_ids: list[str],
+    committed: list[Event],
+    staged: list[Event],
+) -> list[dict]:
+    """Seq ranges still missing from the source for a session commit.
+
+    The two lists are the history's current committed events and the open
+    session's staged events -- never merged, only inspected, so neither is
+    mutated.
+
+    A staged identity that already exists in the committed history is first
+    compared on full original content (key, op, value and the *complete*
+    clock, via the same full-equality rule used by merges); every
+    same-identity/different-content conflict is collected, sorted by
+    (replica_id, seq), and reported together as a 409.
+
+    For each replica the demand upper bound is the maximum of:
+
+    * the highest own seq among the committed+staged events of that replica,
+    * every event clock's component for that replica (a staged event may
+      legitimately depend on a cross-replica predecessor that has not arrived
+      yet).
+
+    Everything from seq 1 up to that bound whose identity is present neither
+    in the committed history nor in the session is missing; missing seqs are
+    coalesced into the largest possible closed [start_seq, end_seq] ranges.
+    A bound of 0 (the replica is demanded neither by its own events nor by
+    any clock component) produces no range.  Missing seqs are never expanded
+    individually -- a gap reaching 10**12 is still one range.  Ranges are
+    sorted by (replica_id, start_seq).  An empty list means only that every
+    demanded identity is present; it does not promise the commit passes
+    (causal/order validation still runs at commit time).
+    """
+
+    committed_by_id = {(ev.replica_id, ev.seq): ev for ev in committed}
+
+    # Full-content conflicts between staged and committed identities first:
+    # report *all* of them, sorted by (replica_id, seq), and nothing else.
+    conflicts: list[tuple[str, int]] = []
+    staged_by_id: dict[tuple[str, int], Event] = {}
+    for ev in staged:
+        ident = (ev.replica_id, ev.seq)
+        prior = committed_by_id.get(ident)
+        if prior is not None and not _same_event_content(prior, ev):
+            conflicts.append(ident)
+        staged_by_id.setdefault(ident, ev)
+    if conflicts:
+        raise ConflictStateError(
+            [
+                {
+                    "code": "event_content_mismatch",
+                    "message": (
+                        f"staged event with replica_id {rid!r}, seq {seq} "
+                        "already exists in the committed history with "
+                        f"different content; stored "
+                        f"{_event_wire(committed_by_id[(rid, seq)])!r}, "
+                        f"staged {_event_wire(staged_by_id[(rid, seq)])!r}"
+                    ),
+                    "replica_id": rid,
+                    "seq": seq,
+                }
+                for rid, seq in sorted(set(conflicts))
+            ]
+        )
+
+    # Per-replica demand upper bound: own max seq and every clock component.
+    bound = {rid: 0 for rid in replica_ids}
+    present: dict[str, set[int]] = {rid: set() for rid in replica_ids}
+    for ev in committed:
+        present[ev.replica_id].add(ev.seq)
+    for ev in staged:
+        present[ev.replica_id].add(ev.seq)
+    for ev in committed + staged:
+        if ev.seq > bound[ev.replica_id]:
+            bound[ev.replica_id] = ev.seq
+        # Stored/staged events always cover exactly the history's replicas.
+        for rid in replica_ids:
+            if ev.clock[rid] > bound[rid]:
+                bound[rid] = ev.clock[rid]
+
+    ranges: list[dict] = []
+    for rid in replica_ids:
+        upper = bound[rid]
+        if upper == 0:
+            continue
+        have = present[rid]
+        # Walk only the present identities and derive maximal missing runs
+        # from the gaps between them; never iterate every missing seq.
+        start = 1
+        for n in sorted(have):
+            if n > upper:
+                break
+            if n > start:
+                ranges.append(
+                    {"replica_id": rid, "start_seq": start, "end_seq": n - 1}
+                )
+            start = n + 1
+        if start <= upper:
+            ranges.append(
+                {"replica_id": rid, "start_seq": start, "end_seq": upper}
+            )
+
+    ranges.sort(key=lambda r: (r["replica_id"], r["start_seq"]))
+    return ranges
 
 
 def _key_verdict(key: str, group: list[Event], replica_ids: list[str]) -> dict:
@@ -1725,6 +1844,38 @@ def read_import_session(history_id: str, session_id: str) -> dict:
         raise SessionNotFound(session_id)
     sid, status, staged = _load_session_row(srow, replica_ids)
     return _session_state(sid, history_id, status, staged, replica_ids)
+
+
+@app.get(
+    "/api/histories/{history_id}/import-sessions/{session_id}/missing-ranges",
+    tags=["import-sessions"],
+    response_model=None,
+)
+def read_import_session_missing_ranges(
+    history_id: str, session_id: str
+) -> dict:
+    """List the seq ranges a session still must fetch before a commit.
+
+    Read-only: the history, the session and their statuses are never
+    modified and the session is not committed.  The committed history and
+    the staged events come from one committed snapshot.  A staged identity
+    that the committed history already holds with different full content is
+    409 listing every conflicting (replica_id, seq), sorted; otherwise the
+    response is 200 with ``missing_ranges`` -- closed [start_seq, end_seq]
+    ranges sorted by replica_id then start_seq.  An empty list means all
+    demanded identities are present, not that the commit is guaranteed to
+    pass.  Closed sessions are queryable too; an unknown history or session
+    is 404.
+    """
+
+    hrow, srow = store.get_history_with_session(history_id, session_id)
+    if hrow is None:
+        raise HistoryNotFound(history_id)
+    _, replica_ids, committed = _load_row(hrow)
+    if srow is None:
+        raise SessionNotFound(session_id)
+    _, _, staged = _load_session_row(srow, replica_ids)
+    return {"missing_ranges": _missing_ranges(replica_ids, committed, staged)}
 
 
 @app.post(
